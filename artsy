@@ -1,0 +1,245 @@
+#!/usr/bin/python
+
+import sys, os, glob, re, time
+from markdown import markdown
+from mako.template import Template
+from mako.lookup import TemplateLookup
+
+def head_split(filestring):
+    'Split the head from the content.'
+    # everything up to first blank line is the head
+    head, content = re.split('\n\s*\n', filestring, 1)
+    return head, content
+    
+NORMAL_RE = re.compile(r'[^\w\s-]')
+SPACE_RE = re.compile(r'\s+')
+def slugify(string):
+    slug = string.strip()
+    slug = NORMAL_RE.sub('', slug)
+    slug = SPACE_RE.sub('_', slug)
+    return slug
+
+def get_file_dict(filestring):
+    'Convert source file into dictionary.'
+    head, content = head_split(filestring)
+
+    # first line in the source file should be the title
+    file_dict = {'title': head.splitlines()[0]}
+
+    # super-awesome regex for grabbing metadata (here referred to
+    # as terms and definitions)
+    dtdd = re.compile(r'''
+            ^\*\s*     # an asterisk at the beginning of the line, 
+                       # optionally followed by whitespace
+            (\w*):\s*  # term, followed by a colon and optional whitespace
+            (.*?)      # the definition
+            (?=^\*|\Z) # followed by an asterisk at the beginning of the
+                       # next line OR the end of the string
+            ''', re.M | re.S | re.X)
+
+    for definition_pair in dtdd.findall(head):
+        term, definition = definition_pair
+        # remove newlines and extra spaces from definitions
+        nice_definition = ' '.join(definition.split())
+        file_dict[term] = nice_definition
+
+    # last, but not least, is the content of the source file
+    file_dict['content'] = content
+    file_dict['keyslugs'] = [(keyword, slugify(keyword)) for keyword in 
+        file_dict['keywords'].split(', ')]
+
+    return file_dict
+
+def atom_date(time_tuple):
+    'formats date as specified in Atom specs'
+    return time.strftime('%Y-%m-%dT%H:%M:%S-05:00', time_tuple)
+
+def file_time(filename):
+    'get last modified time of a file in YYYY-MM-DD format'
+    time_tuple = time.localtime(os.stat(filename).st_mtime)
+    return atom_date(time_tuple)
+
+def now_time():
+    time_tuple = time.localtime()
+    return atom_date(time_tuple)
+
+def set_date(filename, filestring):
+    head, content = head_split(filestring)
+    now = now_time()
+    head = head + '\n* date: %s\n' % now
+    new_filestring = '\n'.join([head, content])
+    f = open(filename, 'w')
+    try: 
+        f.write(new_filestring)
+    finally:
+        f.close()
+    return now
+    
+def get_basename(filename):
+    'get file name without directory or extension'
+    basename = os.path.splitext(os.path.basename(filename))[0]
+    return basename
+
+def del_html(filenames, site_dir):
+    'Delete each html file for which there is no corresponding mdwn file.'
+
+    # shave extension off of filenames 
+    basenames = [get_basename(filename) for filename in filenames]
+
+    htmlfiles = glob.glob(os.path.join(site_dir, '*.html'))
+    for htmlname in htmlfiles:
+        if get_basename(htmlname) not in basenames:
+            print 'Removing %s...' % htmlname,
+            os.remove(htmlname)
+            print 'done.'
+
+def process_files(filenames, site_dir, count):
+    'Grab metadata out of source files and create html files'
+    articles_by_date = []
+    articles_by_keyword = {}
+    for filename in filenames:
+        print 'Processing %s...' % filename,
+        f = open(filename).read().decode('utf8')
+        file_dict = get_file_dict(f)
+        # add "last modified" metadata
+        if 'date' not in file_dict:
+            file_dict['date'] = set_date(filename, f)
+        file_dict['created'] = file_dict['date']
+        file_dict['modified'] = file_time(filename)
+        file_dict['content'] = markdown(file_dict['content'])
+        #print file_dict.keys()
+        print 'done.'
+
+        basename = os.path.splitext(os.path.basename(filename))[0]
+        htmlname = os.path.join(site_dir, basename) + '.html'
+        if os.path.exists(htmlname) and \
+                os.path.getmtime(filename) < os.path.getmtime(htmlname):
+            #print '%s not written: File is current' % htmlname
+            pass  # only talk when you walk
+        else:
+            print 'Writing %s...' % htmlname,
+            # get article template and generate html file with 
+            # assigned variables
+            art_tmpl = tmpl_lookup.get_template('art.html')
+            out_stream = art_tmpl.render(
+                title = file_dict.get('title', ''),
+                created = file_dict.get('created', ''),
+                modified = file_dict.get('modified', ''),
+                description = file_dict.get('description', ''),
+                keywords = file_dict.get('keywords', ''),
+                keyslugs = file_dict.get('keyslugs', []),
+                content = file_dict.get('content', ''),
+                count = count,
+            )
+            handle = open(htmlname, 'w')
+            try:
+                handle.write(out_stream)
+                print 'done.'
+            finally:
+                handle.close()
+            
+        # collect file data, date first, for sorting for index.html
+        link = get_basename(filename)
+        file_dict['link'] = link
+        date_tuple = (file_dict['date'], file_dict)
+        articles_by_date.append(date_tuple)
+        for keyword, slug in file_dict['keyslugs']:
+            try:
+                articles_by_keyword[keyword].append(file_dict)
+            except KeyError:
+                articles_by_keyword[keyword] = [file_dict]
+    articles_by_date.sort(reverse=True)
+    return articles_by_date, articles_by_keyword
+
+def keyword_pages(articles_by_keyword, site_dir, count):
+    if not articles_by_keyword:
+        print 'No keywords found'
+        return
+    keywords_dir = os.path.join(site_dir, 'keywords')
+    if not os.path.exists(keywords_dir):
+        os.makedirs(keywords_dir)
+    template = tmpl_lookup.get_template('keyword.html')
+    for keyword in articles_by_keyword:
+        print 'Processing %s...' % keyword,
+        slug = slugify(keyword)
+        path = os.path.join(keywords_dir, '%s.html' % slug)
+        # DSU
+        arts = articles_by_keyword[keyword]
+        arts = [(art['created'], art) for art in arts]
+        arts.sort(reverse=True)
+        arts = [art[1] for art in arts]
+        out = template.render(
+            this_keyword = keyword,
+            this_slug = slug,
+            count = count,
+            arts = arts,
+        )
+        handle = open(path, 'w')
+        try:
+            handle.write(out)
+            print 'done.'
+        finally:
+            handle.close()
+
+def index_n_feed(articles_by_date, site_dir, count):
+    if not articles_by_date:
+        print 'No articles found'
+        return
+    dict_list = [dict_ for (date, dict_) in articles_by_date]
+    # write index.html
+    index_html = os.path.join(site_dir, 'index.html')
+    print 'Writing %s...' % index_html,
+    index_tmpl = tmpl_lookup.get_template('index.html')
+    #index_tmpl = Template(filename='templates/index.html')
+    out_stream = index_tmpl.render(
+        arts = dict_list, 
+        count = count,
+    )
+    i = open(index_html, 'w')
+    try:
+        i.write(out_stream)
+        print 'done.'
+    finally:
+        i.close()
+
+    # write atom feed
+    index_feed = os.path.join(site_dir, 'index_feed.xml')
+    print 'Writing %s...' % index_feed,
+    #index_feed_tmpl = tmpl_lookup.get_template('index_feed.xml')
+    index_feed_tmpl = tmpl_lookup.get_template('index_feed.xml')
+    out_stream = index_feed_tmpl.render(
+        arts = dict_list, 
+        count = count,
+    )
+    #i = codecs.open(index_feed, 'w', 'utf8')
+    i = open(index_feed, 'w')
+    try:
+        i.write(out_stream)
+        print 'done.'
+    finally:
+        i.close()
+
+def main(site_dir):
+    'main function'
+    filenames = glob.glob(os.path.join(site_dir, 'art/*.mdwn'))
+    filenames.sort()
+    count = len(filenames)
+    del_html(filenames, site_dir)
+    articles_by_date, articles_by_keyword = \
+            process_files(filenames, site_dir, count)
+    index_n_feed(articles_by_date, site_dir, count)
+    keyword_pages(articles_by_keyword, site_dir, count)
+
+if __name__ == '__main__':
+    try: 
+        site_dir = sys.argv[1]
+    except IndexError: 
+        site_dir = os.path.dirname(__file__)
+
+    tmpl_lookup = TemplateLookup(
+            directories=[site_dir + '/templates'], 
+            module_directory=site_dir + '/mako_modules',
+            input_encoding='utf-8', 
+            output_encoding='utf-8')
+
+    main(site_dir)
